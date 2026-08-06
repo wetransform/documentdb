@@ -35,7 +35,8 @@ permissions:
 
 env:
   IMAGE_NAME: documentdb-local
-  IMAGE_TAG: ${{ github.run_id }}-$(date +'%Y-%m-%d')
+  IMAGE_TAG: trace-4fbbfcb8-${{ github.run_id }}
+  SOURCE_SHA: 4fbbfcb879cfdedaab5e5f4b37698fbc28f0a7e9
 
 jobs:
   build-and-push:
@@ -52,10 +53,7 @@ jobs:
             base_arch: ARM64
             runner: ubuntu-22.04-arm
         pg_version:
-          - 15
-          - 16
           - 17
-          - 18
     runs-on: ${{ matrix.runner }}
     outputs:
       # The shared action names its dotted output `version`; the job output
@@ -64,9 +62,15 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v5
+      with:
+        ref: ${{ env.SOURCE_SHA }}
     - name: Extract and Format Default Version
       id: extract_version
       uses: ./.github/actions/resolve-documentdb-version
+    - name: Verify requested source and version
+      run: |
+        test "$(git rev-parse HEAD)" = "${{ env.SOURCE_SHA }}"
+        test "${{ steps.extract_version.outputs.version_dash }}" = "0.117-0"
     - name: Build Debian Package
       run: |
         ./packaging/build_packages.sh --os deb13 --pg ${{ matrix.pg_version }} --output-dir downloaded-artifacts
@@ -177,7 +181,7 @@ jobs:
     # and on any workflow_call whose top-level event was a dispatch, which is
     # what made a release dry run publish images as a side effect.
     - name: Push ${{ matrix.arch }} Image
-      if: inputs.push_images || startsWith(github.ref, 'refs/tags/')
+      if: inputs.push_images || startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/release/trace-4fbbfcb8'
       run: |
         TAG=${{ env.IMAGE_TAG }}-pg${{ matrix.pg_version }}-${{ matrix.arch }}
         echo "Pushing image ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:$TAG"
@@ -187,14 +191,11 @@ jobs:
     name: Create, Push, Sign & Verify Manifest
     # Must match the per-arch push gate above: a manifest can only reference
     # images that were actually published.
-    if: inputs.push_images || startsWith(github.ref, 'refs/tags/')
+    if: inputs.push_images || startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/release/trace-4fbbfcb8'
     strategy:
       matrix:
         pg_version:
-          - 15
-          - 16
           - 17
-          - 18
     runs-on: ubuntu-22.04
     needs: build-and-push
     steps:
@@ -204,7 +205,7 @@ jobs:
       run: echo "Using DOCUMENTDB_VERSION=${{ needs.build-and-push.outputs.documentdb_version }}"
     - name: Set Default Values
       run: |
-        echo "MANIFEST_TAG=pg${{ matrix.pg_version }}-${{ needs.build-and-push.outputs.documentdb_version }}" >> $GITHUB_ENV
+        echo "MANIFEST_TAG=trace-4fbbfcb8" >> $GITHUB_ENV
     - name: Create & push manifest for all PG versions
       run: |
         docker manifest create ghcr.io/${{ github.repository }}/${{ env.IMAGE_NAME }}:${{ env.MANIFEST_TAG }} \
