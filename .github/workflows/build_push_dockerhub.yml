@@ -1,0 +1,131 @@
+name: Build & push gateway image to Docker Hub (wetransform pool-loss fix)
+
+# wetransform-internal, NOT an upstream workflow. Builds a single-arch (amd64,
+# EKS node arch) DocumentDB gateway image for one PG version, smoke-tests it, and
+# publishes it to Docker Hub `wetransform/documentdb-local` — our first-party
+# registry convention (the pull secret already authenticates index.docker.io).
+# Deliberately separate from the upstream `build_gateway.yml` (which targets GHCR,
+# builds all arch/PG combos, and cosign-signs) so upstream merges stay clean.
+#
+# Prerequisite: repo secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN must be set on
+# the fork (Settings -> Secrets and variables -> Actions).
+#
+# Manual-dispatch only — never triggers on push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker Hub tag to publish as wetransform/documentdb-local:<tag>'
+        default: '0.114-0-poolfix'
+        required: true
+        type: string
+      pg_version:
+        description: 'PostgreSQL major version (must match the deployed engine)'
+        default: '17'
+        required: true
+        type: string
+      push_image:
+        description: 'Publish to Docker Hub. Leave unchecked to build + smoke-test only.'
+        default: false
+        required: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: wetransform/documentdb-local
+
+jobs:
+  build-and-push:
+    name: Build, smoke-test, push (amd64)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Build Debian extension package (deb13)
+        run: |
+          ./packaging/build_packages.sh --os deb13 --pg ${{ inputs.pg_version }} --output-dir downloaded-artifacts
+          ls -R downloaded-artifacts
+
+      - name: Build amd64 image
+        run: |
+          set -euo pipefail
+          DEB=$(ls downloaded-artifacts/*.deb | grep -v 'dbgsym' | head -1)
+          echo "Using extension package: $DEB"
+          docker build \
+            --platform linux/amd64 \
+            --build-arg BASE_IMAGE=debian:trixie-slim \
+            --build-arg POSTGRES_VERSION=${{ inputs.pg_version }} \
+            --build-arg DEB_PACKAGE_REL_PATH="$DEB" \
+            -t "${IMAGE_REPO}:${{ inputs.image_tag }}" \
+            -f packaging/gateway/docker/Dockerfile_documentdb_local .
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          IMAGE="${IMAGE_REPO}:${{ inputs.image_tag }}"
+          CONTAINER_NAME=documentdb-local-smoke
+          SMOKE_DIR=$(mktemp -d)
+          chmod 755 "$SMOKE_DIR"
+          dump_logs=true
+          cleanup() {
+            if [ "$dump_logs" = "true" ]; then
+              docker logs "$CONTAINER_NAME" || true
+            fi
+            docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+            rm -rf "$SMOKE_DIR"
+          }
+          wait_for_log() {
+            local pattern="$1"; local timeout_seconds="$2"; local waited=0
+            while ! docker logs "$CONTAINER_NAME" 2>&1 | grep -Fq "$pattern"; do
+              running=$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || echo false)
+              if [ "$running" != "true" ]; then
+                echo "Container exited before log pattern appeared: $pattern" >&2
+                return 1
+              fi
+              sleep 2; waited=$((waited + 2))
+              if [ "$waited" -ge "$timeout_seconds" ]; then
+                echo "Timed out waiting for log pattern: $pattern" >&2
+                return 1
+              fi
+            done
+          }
+          trap cleanup EXIT
+
+          cat > "$SMOKE_DIR/001-gateway-smoke-init.js" <<'EOF'
+          const smokeDb = db.getSiblingDB('gateway_smoke');
+          smokeDb.image_smoke.deleteMany({});
+          smokeDb.image_smoke.insertOne({ name: 'documentdb-local-smoke', ok: true });
+          EOF
+
+          docker run -d --name "$CONTAINER_NAME" \
+            --mount "type=bind,source=$SMOKE_DIR,target=/init_doc_db.d,readonly" \
+            "$IMAGE" --username docdb_admin --password 123456 --init-data-path /init_doc_db.d
+
+          wait_for_log "=== DocumentDB is ready ===" 240
+          wait_for_log "Custom data initialization completed." 180
+
+          docker exec "$CONTAINER_NAME" mongosh "localhost:10260" \
+            -u docdb_admin -p 123456 --authenticationMechanism SCRAM-SHA-256 \
+            --tls --tlsAllowInvalidCertificates --quiet \
+            --eval 'const count = db.getSiblingDB("gateway_smoke").image_smoke.countDocuments({ name: "documentdb-local-smoke", ok: true }); if (count !== 1) { print(`expected 1 document, found ${count}`); quit(1); }'
+
+          dump_logs=false
+
+      - name: Login to Docker Hub
+        if: ${{ inputs.push_image }}
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Push image
+        if: ${{ inputs.push_image }}
+        run: docker push "${IMAGE_REPO}:${{ inputs.image_tag }}"
+
+      - name: Print immutable digest to pin
+        if: ${{ inputs.push_image }}
+        run: |
+          echo "=== Pin this in hale-connect-dev documentdb.yml ==="
+          docker buildx imagetools inspect "${IMAGE_REPO}:${{ inputs.image_tag }}" \
+            | awk -v repo="$IMAGE_REPO" '/^Digest:/ { print repo "@" $2 }'
