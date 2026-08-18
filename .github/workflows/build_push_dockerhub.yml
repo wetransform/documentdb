@@ -17,7 +17,7 @@ on:
     inputs:
       image_tag:
         description: 'Docker Hub tag to publish as wetransform/documentdb-local:<tag>'
-        default: '0.114-0-poolfix'
+        default: '0.118-poolfix'
         required: true
         type: string
       pg_version:
