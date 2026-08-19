@@ -63,19 +63,37 @@ impl PgConfigurationInner {
             Err(e) => tracing::warn!("Host Config file not able to be loaded: {e}"),
         }
 
-        let pg_config_rows = match self.pool_manager.system_requests_connection().await {
-            Ok(conn) => conn
-                .query(self.pool_manager.query_catalog().pg_settings(), &[], &[])
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!("Failed to query pg_settings: {e}");
-                    Vec::new()
-                }),
-            Err(e) => {
-                tracing::warn!("Failed to get connection for pg_settings: {e}");
-                Vec::new()
-            }
-        };
+        // pg_settings is the source of the dynamic GUC map (max_connections and
+        // the rest). If it cannot be read, DO NOT continue with a partial map:
+        // returning it would let refresh_configuration() swap in a config missing
+        // max_connections, silently flip it to the 25 default, change the per-user
+        // pool-cache key, and then hard-fail every request with "Connection pool
+        // missing for user". Propagate the error instead so refresh_configuration()
+        // skips the swap and keeps the last-known-good full configuration.
+        let conn = self
+            .pool_manager
+            .system_requests_connection()
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    "Failed to get connection for pg_settings; keeping last-known-good configuration: {e}"
+                );
+                e
+            })?;
+        let pg_config_rows = conn
+            .query(self.pool_manager.query_catalog().pg_settings(), &[], &[])
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    "Failed to query pg_settings; keeping last-known-good configuration: {e}"
+                );
+                DocumentDBError::from(e)
+            })?;
+        if pg_config_rows.is_empty() {
+            return Err(DocumentDBError::internal_error(
+                "pg_settings returned no rows; keeping last-known-good configuration".to_owned(),
+            ));
+        }
 
         // Fetch most up-to-date switch-related values from pg_file_settings for settings that are set there. pg_settings may have stale
         // values if pg_reload_conf() failed or if 030-user-supplied-server-parameters.conf was updated after the gateway started. Then
@@ -440,5 +458,132 @@ impl Drop for PgConfiguration {
         if let Some(watch_task) = &self.watch_task {
             watch_task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        configuration::DocumentDBSetupConfiguration,
+        postgres::{
+            conn_mgmt::{
+                ConnectionPool, PgPoolSettings, AUTHENTICATION_MAX_CONNECTIONS,
+                SYSTEM_REQUESTS_MAX_CONNECTIONS,
+            },
+            create_query_catalog,
+        },
+    };
+
+    /// Base setup configuration overridden with a guaranteed-closed local
+    /// Postgres endpoint (127.0.0.1:1), so connection attempts fail fast and
+    /// deterministically instead of depending on whatever Postgres endpoint
+    /// happens to be unreachable in the test environment.
+    fn test_setup_configuration() -> DocumentDBSetupConfiguration {
+        DocumentDBSetupConfiguration {
+            postgres_host_name: Some("127.0.0.1".to_owned()),
+            postgres_port: Some(1),
+            ..crate::testing::test_setup_configuration()
+        }
+    }
+
+    /// Builds a real `PoolManager`. The pools are lazy (deadpool), so no live
+    /// Postgres is required, but pool creation must run inside a Tokio runtime.
+    fn test_pool_manager() -> Arc<PoolManager> {
+        let setup_config = test_setup_configuration();
+        let query_catalog = create_query_catalog();
+        let user = setup_config.postgres_system_user().to_owned();
+
+        let system_requests_pool = ConnectionPool::new_with_user(
+            &setup_config,
+            &query_catalog,
+            &user,
+            None,
+            &format!("{}-SystemRequests", setup_config.application_name()),
+            PgPoolSettings::system_pool_settings(SYSTEM_REQUESTS_MAX_CONNECTIONS),
+        )
+        .expect("failed to create system requests pool");
+
+        let authentication_pool = ConnectionPool::new_with_user(
+            &setup_config,
+            &query_catalog,
+            &user,
+            None,
+            &format!("{}-PreAuthRequests", setup_config.application_name()),
+            PgPoolSettings::system_pool_settings(AUTHENTICATION_MAX_CONNECTIONS),
+        )
+        .expect("failed to create authentication pool");
+
+        Arc::new(PoolManager::new(
+            query_catalog,
+            Box::new(setup_config),
+            system_requests_pool,
+            authentication_pool,
+        ))
+    }
+
+    #[tokio::test]
+    async fn load_configurations_errors_when_pg_settings_unavailable() {
+        tokio::task::yield_now().await; // lets the lazy pools build inside the runtime
+        let inner = PgConfigurationInner {
+            dynamic_config_path: String::new(),
+            settings_prefixes: Vec::new(),
+            pool_manager: test_pool_manager(),
+            instance_kind: String::new(),
+            enable_pg_file_settings_refresh: false,
+        };
+        assert!(
+            inner.load_configurations().await.is_err(),
+            "expected Err when pg_settings is unavailable, so refresh keeps last-known-good config"
+        );
+    }
+
+    /// Constructs a `PgConfiguration` directly (bypassing `new()`, which
+    /// would itself fail against the unreachable pool manager) so we can
+    /// seed known-good `values` and then exercise `refresh_configuration()`.
+    fn test_configuration(values: HashMap<String, String>) -> PgConfiguration {
+        PgConfiguration {
+            inner: PgConfigurationInner {
+                dynamic_config_path: String::new(),
+                settings_prefixes: Vec::new(),
+                pool_manager: test_pool_manager(),
+                instance_kind: String::new(),
+                enable_pg_file_settings_refresh: false,
+            },
+            values: ArcSwap::from_pointee(values),
+            last_update_at: ArcSwap::from_pointee(Instant::now()),
+            topology_bson: ArcSwap::from_pointee(rawbson!({})),
+            cluster_version: ArcSwap::from_pointee(None),
+            refresh_task: None,
+            watch_task: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_configuration_keeps_last_known_good_values_on_error() {
+        tokio::task::yield_now().await; // lets the lazy pools build inside the runtime
+
+        let mut initial_values = HashMap::new();
+        initial_values.insert("max_connections".to_owned(), "100".to_owned());
+        let config = test_configuration(initial_values);
+
+        let last_update_before = config.last_update_at();
+
+        let result = config.refresh_configuration().await;
+
+        assert!(
+            result.is_err(),
+            "expected refresh_configuration() to fail against an unreachable Postgres endpoint"
+        );
+        assert_eq!(
+            config.values.load().get("max_connections").map(String::as_str),
+            Some("100"),
+            "values must not be swapped when the refresh fails, keeping the last-known-good configuration"
+        );
+        assert_eq!(
+            config.last_update_at(),
+            last_update_before,
+            "last_update_at must not change when the refresh fails"
+        );
     }
 }
